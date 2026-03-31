@@ -88,3 +88,12 @@ recontructKdTree: true
 # Export settings
 savePCD: true                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
 savePCDDirectory: "/fast_lio_sam_ws/src/FAST_LIO_SAM/PCD/"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+
+# Clean map filter (remove ground, ceiling, robot body)
+filter_high_threshold: 0.5        # 全局系下最大高度(m)，高于此值的点被过滤
+filter_low_threshold: -0.3        # 全局系下最小高度(m)，低于此值的点被过滤
+filter_car_front: 0.5             # 本体系x正方向(前)边界(m)
+filter_car_back: -0.5             # 本体系x负方向(后)边界(m)
+filter_car_left: 0.3              # 本体系y正方向(左)边界(m)
+filter_car_right: -0.3            # 本体系y负方向(右)边界(m)
+filter_keypose_radius: 0.5       # keypose周围裁剪半径(m)，以keypose为中心 ±radius 的方框内点被删除

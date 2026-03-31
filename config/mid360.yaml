@@ -1,7 +1,7 @@
 common:
     lid_topic:  "/livox/lidar"
     imu_topic:  "/livox/imu"
-    gnss_topic:  /gps/fix         #"/imu/data"
+    gnss_topic:  /ublox_gps_node/fix         #"/imu/data"
     gps_euler_topic: /gps/euler   # NED euler angles (geometry_msgs/Vector3Stamped: x=roll, y=pitch, z=heading)
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
 
@@ -20,11 +20,11 @@ mapping:
     det_range:     100.0
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic,
    # extrinsic_T: [ 0, 0, 0]
-    extrinsic_T: [ 0.367, -0.00, 0.015]
+    extrinsic_T: [ 0.366, -0.00, 0.15]
     extrinsic_R: [ 1, 0, 0, 
                    0, 1, 0, 
                    0, 0, 1]
-    extrinT_Gnss2Lidar: [ -0.76, 0, -0.00]
+    extrinT_Gnss2Lidar: [ -0.563, 0, -0.00]
     extrinR_Gnss2Lidar: [ 1, 0, 0, 
                           0, 1, 0, 
                           0, 0, 1]
@@ -72,6 +72,11 @@ historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the b
 useImuHeadingInitialization: true           # if using GPS data, set to "true"
 useGpsElevation: false                      # if GPS elevation is bad, set to "false"
 enu_init_en: true
+single_antenna_mode: true                   # true: 单天线模式，不接收/gps/euler，通过移动方向估计航向; false: 双天线模式
+singleAntenna_minMoveDist: 0.2               # 米, 单天线模式下判定航向所需的最小移动距离
+singleAntenna_minMoveSpeed: 0.5              # m/s, 单天线模式下有效航向的最小移动速度
+singleAntenna_headingStableCnt: 3            # 连续N次航向一致后才确认航向
+singleAntenna_headingStdThresh: 0.15         # rad, 航向稳定性阈值(标准差)，小于此值认为航向收敛
 gpsCovThreshold: 0.0002                       # m^2, threshold for using GPS data
 poseCovThreshold: 0 #25.0                      # m^2, threshold for using GPS data  位姿协方差阈值 from isam2
 gpsNoiseFloor: 0.1                           # m^2, GPS因子最小噪声方差，RTK固定解建议0.01，普通GPS建议1.0
@@ -93,3 +98,12 @@ recontructKdTree: true
 # Export settings
 savePCD: true                         # https://github.com/TixiaoShan/LIO-SAM/issues/3
 savePCDDirectory: "/catkin_fastlio_slam/src/FAST_LIO_SAM/FAST_LIO_SAM/data"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+
+# Clean map filter (remove ground, ceiling, robot body)
+filter_high_threshold: 0.5        # 全局系下最大高度(m)，高于此值的点被过滤
+filter_low_threshold: -0.3        # 全局系下最小高度(m)，低于此值的点被过滤
+filter_car_front: 0.5             # 本体系x正方向(前)边界(m)
+filter_car_back: -0.5             # 本体系x负方向(后)边界(m)
+filter_car_left: 0.3              # 本体系y正方向(左)边界(m)
+filter_car_right: -0.3            # 本体系y负方向(右)边界(m)
+filter_keypose_radius: 0.5       # keypose周围裁剪半径(m)，以keypose为中心 ±radius 的方框内点被删除

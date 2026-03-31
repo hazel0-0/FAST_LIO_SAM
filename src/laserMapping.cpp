@@ -103,6 +103,7 @@
 // save map
 #include "fast_lio_sam/save_map.h"
 #include "fast_lio_sam/save_pose.h"
+#include <std_srvs/Trigger.h>
 
 // save data in kitti format 
 #include <sstream>
@@ -288,6 +289,15 @@ string gps_euler_topic;
 bool useImuHeadingInitialization;   
 bool useGpsElevation;             //  是否使用gps高层优化
 bool enu_init_en = false;          //  是否启用 ENU 坐标系初始化
+bool dual_antenna_en = true;       //  双天线模式（true: /gps/euler, false: 运动方向估计航向）
+double heading_min_distance = 3.0; //  单天线模式最小移动距离(m)
+bool heading_estimated = false;    //  航向是否已估计
+double estimated_heading_yaw = 0.0; // 估计的ENU yaw (rad)
+V3D heading_vis_start = V3D::Zero();  // 航向可视化起点（ENU）
+V3D heading_vis_end = V3D::Zero();    // 航向可视化终点（ENU）
+double heading_move_dist_2d = 0.0;
+V3D latest_gnss_antenna_enu = V3D::Zero(); // 最新GNSS天线ENU位置（用于初始化）
+bool latest_gnss_antenna_valid = false;
 float gpsCovThreshold;          //   gps方向角和高度差的协方差阈值
 float poseCovThreshold;       //  位姿协方差阈值  from isam2
 float gpsNoiseFloor;          //  GPS因子最小噪声方差 (m^2)，控制RTK权重上限
@@ -315,8 +325,20 @@ float globalMapVisualizationLeafSize;
 // saveMap
 ros::ServiceServer srvSaveMap;
 ros::ServiceServer srvSavePose;
+ros::ServiceServer srvConfirmHeading;
+ros::Publisher pubEstimatedHeading;
+ros::Publisher pubHeadingViz;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
+
+// 点云过滤参数（用于保存清洁地图）
+double filter_high_threshold;   // 全局系下最大高度(m)
+double filter_low_threshold;    // 全局系下最小高度(m)
+double filter_car_left;         // 本体系 y 正方向边界(m)
+double filter_car_right;        // 本体系 y 负方向边界(m)
+double filter_car_front;        // 本体系 x 正方向边界(m)
+double filter_car_back;         // 本体系 x 负方向边界(m)
+double filter_keypose_radius;   // keypose周围裁剪半径(m)
 
 
 /**
@@ -373,6 +395,107 @@ pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::
         cloudOut->points[i].z = transCur(2, 0) * pointFrom.x + transCur(2, 1) * pointFrom.y + transCur(2, 2) * pointFrom.z + transCur(2, 3);
         cloudOut->points[i].intensity = pointFrom.intensity;
     }
+    return cloudOut;
+}
+
+pcl::PointCloud<PointType>::Ptr transformPointCloudFiltered(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose *transformIn)
+{
+    pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+
+    Eigen::Isometry3d T_b_lidar(state_point.offset_R_L_I);
+    T_b_lidar.pretranslate(state_point.offset_T_L_I);
+
+    Eigen::Affine3f T_w_b_ = pcl::getTransformation(transformIn->x, transformIn->y, transformIn->z,
+                                                      transformIn->roll, transformIn->pitch, transformIn->yaw);
+    Eigen::Isometry3d T_w_b;
+    T_w_b.matrix() = T_w_b_.matrix().cast<double>();
+
+    Eigen::Isometry3d T_w_lidar = T_w_b * T_b_lidar;
+    Eigen::Matrix3d R_w_lidar = T_w_lidar.rotation();
+
+    // T_b_lidar 的逆 = T_lidar_b，用于将 LiDAR 点转到 body 系做本体过滤
+    Eigen::Isometry3d T_lidar_b = T_b_lidar.inverse();
+    Eigen::Matrix3d R_lidar_b = T_lidar_b.rotation();
+    Eigen::Vector3d t_lidar_b = T_lidar_b.translation();
+
+    for (int i = 0; i < (int)cloudIn->size(); ++i)
+    {
+        const auto &pt_lidar = cloudIn->points[i];
+        // LiDAR -> body 系，过滤机器狗本体
+        double bx = R_lidar_b(0,0)*pt_lidar.x + R_lidar_b(0,1)*pt_lidar.y + R_lidar_b(0,2)*pt_lidar.z + t_lidar_b(0);
+        double by = R_lidar_b(1,0)*pt_lidar.x + R_lidar_b(1,1)*pt_lidar.y + R_lidar_b(1,2)*pt_lidar.z + t_lidar_b(1);
+        double bz = R_lidar_b(2,0)*pt_lidar.x + R_lidar_b(2,1)*pt_lidar.y + R_lidar_b(2,2)*pt_lidar.z + t_lidar_b(2);
+        if (bx < filter_car_front && bx > filter_car_back &&
+            by < filter_car_left  && by > filter_car_right)
+            continue;
+        if (bz > filter_high_threshold || bz < filter_low_threshold)
+            continue;
+        // 先旋转到 world 方向（不平移），用于高度过滤
+        double rz = R_w_lidar(2,0)*pt_lidar.x + R_w_lidar(2,1)*pt_lidar.y + R_w_lidar(2,2)*pt_lidar.z;
+
+        // 旋转后的z为相对机器人的高度，过滤地面和天花板
+        if (rz > filter_high_threshold || rz < filter_low_threshold)
+            continue;
+
+        // 通过高度过滤后，再做完整变换（旋转+平移）到 world 系
+        PointType pt_out;
+        pt_out.x = T_w_lidar(0,0)*pt_lidar.x + T_w_lidar(0,1)*pt_lidar.y + T_w_lidar(0,2)*pt_lidar.z + T_w_lidar(0,3);
+        pt_out.y = T_w_lidar(1,0)*pt_lidar.x + T_w_lidar(1,1)*pt_lidar.y + T_w_lidar(1,2)*pt_lidar.z + T_w_lidar(1,3);
+        pt_out.z = T_w_lidar(2,0)*pt_lidar.x + T_w_lidar(2,1)*pt_lidar.y + T_w_lidar(2,2)*pt_lidar.z + T_w_lidar(2,3);
+        pt_out.intensity = pt_lidar.intensity;
+        cloudOut->points.push_back(pt_out);
+    }
+    cloudOut->width = cloudOut->points.size();
+    cloudOut->height = 1;
+    cloudOut->is_dense = true;
+    return cloudOut;
+}
+
+pcl::PointCloud<PointType>::Ptr removeKeyposeArea(pcl::PointCloud<PointType>::Ptr cloudIn, double radius)
+{
+    // 投影到 z=0 平面建 KD-tree，实现纯 2D 搜索
+    pcl::PointCloud<PointType>::Ptr cloud2D(new pcl::PointCloud<PointType>());
+    cloud2D->resize(cloudIn->size());
+    for (int i = 0; i < (int)cloudIn->size(); i++) {
+        cloud2D->points[i] = cloudIn->points[i];
+        cloud2D->points[i].z = 0;
+    }
+    pcl::KdTreeFLANN<PointType> kdtree2D;
+    kdtree2D.setInputCloud(cloud2D);
+
+    std::vector<bool> keep(cloudIn->size(), true);
+    std::vector<int> searchIdx;
+    std::vector<float> searchDist;
+    float r = (float)radius;
+    float search_r = r * 1.42f;
+
+    for (int k = 0; k < (int)cloudKeyPoses6D->size(); k++) {
+        const auto &kp = cloudKeyPoses6D->points[k];
+        PointType searchPt;
+        searchPt.x = kp.x; searchPt.y = kp.y; searchPt.z = 0;
+        float cy = cos(kp.yaw), sy = sin(kp.yaw);
+
+        kdtree2D.radiusSearch(searchPt, search_r, searchIdx, searchDist);
+        for (int idx : searchIdx) {
+            float dx = cloudIn->points[idx].x - kp.x;
+            float dy = cloudIn->points[idx].y - kp.y;
+            float lx =  cy * dx + sy * dy;
+            float ly = -sy * dx + cy * dy;
+            if (lx > -r && lx < r && ly > -r && ly < r)
+                keep[idx] = false;
+        }
+    }
+
+    pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+    cloudOut->reserve(cloudIn->size());
+    for (int i = 0; i < (int)cloudIn->size(); i++) {
+        if (keep[i])
+            cloudOut->points.push_back(cloudIn->points[i]);
+    }
+    cloudOut->width = cloudOut->points.size();
+    cloudOut->height = 1;
+    cloudOut->is_dense = true;
+    cout << "Keypose filter: " << cloudIn->size() << " -> " << cloudOut->size() << " pts" << endl;
     return cloudOut;
 }
 
@@ -1410,6 +1533,54 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 
         // GNSS天线在ENU下的位置
         V3D P_gnss_enu(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
+        latest_gnss_antenna_enu = P_gnss_enu;
+        latest_gnss_antenna_valid = true;
+
+        // 单天线航向估计：迁移到 IMU_Processing 中，融合 GNSS 位移 + IMU 角速度
+        if (enu_init_en && !dual_antenna_en)
+        {
+            bool heading_updated = p_imu->update_single_antenna_heading(
+                P_gnss_enu,
+                gnss_data.time,
+                heading_min_distance,
+                estimated_heading_yaw,
+                heading_vis_start,
+                heading_vis_end,
+                heading_move_dist_2d);
+
+            heading_estimated = heading_estimated || heading_updated;
+
+            if (heading_estimated)
+            {
+                nav_msgs::Odometry heading_msg;
+                heading_msg.header.stamp = ros::Time::now();
+                heading_msg.header.frame_id = "camera_init";
+                heading_msg.pose.pose.position.x = P_gnss_enu.x();
+                heading_msg.pose.pose.position.y = P_gnss_enu.y();
+                heading_msg.pose.pose.position.z = P_gnss_enu.z();
+                tf::Quaternion q;
+                q.setRPY(0, 0, estimated_heading_yaw);
+                heading_msg.pose.pose.orientation.x = q.x();
+                heading_msg.pose.pose.orientation.y = q.y();
+                heading_msg.pose.pose.orientation.z = q.z();
+                heading_msg.pose.pose.orientation.w = q.w();
+                pubEstimatedHeading.publish(heading_msg);
+                ROS_INFO_THROTTLE(1.0, "Single antenna fused heading = %.2f deg (seg move %.2fm)",
+                                  estimated_heading_yaw * 180.0 / M_PI, heading_move_dist_2d);
+            }
+            else
+            {
+                ROS_INFO_THROTTLE(2.0, "Single antenna: moved %.2fm / %.2fm needed ...",
+                                  heading_move_dist_2d, heading_min_distance);
+            }
+
+            publish_heading_visualization(P_gnss_enu,
+                                          heading_estimated,
+                                          estimated_heading_yaw,
+                                          heading_vis_start,
+                                          heading_vis_end,
+                                          heading_move_dist_2d);
+        }
 
         // 用当前IMU姿态旋转杆臂，将GNSS天线ENU位置补偿到IMU的ENU位置
         // P_imu_enu = P_gnss_enu - R_enu_imu * T_gnss_in_imu
@@ -1789,6 +1960,77 @@ void publish_gnss_path(const ros::Publisher pubPath)
     }
 }
 
+void publish_heading_visualization(const V3D &gnss_pos_enu,
+                                   bool heading_valid,
+                                   double heading_yaw,
+                                   const V3D &heading_start_enu,
+                                   const V3D &heading_end_enu,
+                                   double move_dist_2d)
+{
+    if (pubHeadingViz.getNumSubscribers() == 0)
+        return;
+
+    visualization_msgs::MarkerArray arr;
+
+    visualization_msgs::Marker rtk_point;
+    rtk_point.header.frame_id = "camera_init";
+    rtk_point.header.stamp = ros::Time::now();
+    rtk_point.ns = "single_antenna_heading";
+    rtk_point.id = 0;
+    rtk_point.type = visualization_msgs::Marker::SPHERE;
+    rtk_point.action = visualization_msgs::Marker::ADD;
+    rtk_point.pose.orientation.w = 1.0;
+    rtk_point.pose.position.x = gnss_pos_enu.x();
+    rtk_point.pose.position.y = gnss_pos_enu.y();
+    rtk_point.pose.position.z = gnss_pos_enu.z();
+    rtk_point.scale.x = 0.35;
+    rtk_point.scale.y = 0.35;
+    rtk_point.scale.z = 0.35;
+    rtk_point.color.r = 0.1;
+    rtk_point.color.g = 0.8;
+    rtk_point.color.b = 1.0;
+    rtk_point.color.a = 0.9;
+    arr.markers.push_back(rtk_point);
+
+    visualization_msgs::Marker heading_arrow;
+    heading_arrow.header = rtk_point.header;
+    heading_arrow.ns = "single_antenna_heading";
+    heading_arrow.id = 1;
+    heading_arrow.type = visualization_msgs::Marker::ARROW;
+    heading_arrow.action = visualization_msgs::Marker::ADD;
+    heading_arrow.pose.orientation.w = 1.0;
+    heading_arrow.scale.x = 0.2;
+    heading_arrow.scale.y = 0.4;
+    heading_arrow.scale.z = 0.4;
+
+    geometry_msgs::Point p0, p1;
+    p0.x = heading_start_enu.x(); p0.y = heading_start_enu.y(); p0.z = gnss_pos_enu.z();
+    if (heading_valid)
+    {
+        p1.x = heading_start_enu.x() + cos(heading_yaw) * std::max(1.0, move_dist_2d);
+        p1.y = heading_start_enu.y() + sin(heading_yaw) * std::max(1.0, move_dist_2d);
+        p1.z = gnss_pos_enu.z();
+        heading_arrow.color.r = 0.95;
+        heading_arrow.color.g = 0.35;
+        heading_arrow.color.b = 0.15;
+        heading_arrow.color.a = 0.95;
+    }
+    else
+    {
+        p1.x = heading_end_enu.x(); p1.y = heading_end_enu.y(); p1.z = gnss_pos_enu.z();
+        heading_arrow.color.r = 0.8;
+        heading_arrow.color.g = 0.8;
+        heading_arrow.color.b = 0.8;
+        heading_arrow.color.a = 0.7;
+    }
+
+    heading_arrow.points.push_back(p0);
+    heading_arrow.points.push_back(p1);
+    arr.markers.push_back(heading_arrow);
+
+    pubHeadingViz.publish(arr);
+}
+
 
 /*定义pose结构体*/
 struct pose
@@ -1813,6 +2055,35 @@ void WriteText(std::ofstream& ofs, pose data){
                                       <<  data.R(1,0)  << " "  << data.R(1,1)  <<" " <<   data.R(1,2)   << " "  <<   data.t[1]  <<  " "
                                       <<  data.R(2,0)  << " "  << data.R(2,1)  <<" " <<   data.R(2,2)   << " "  <<   data.t[2]  <<  std::endl;
 
+}
+
+bool confirmHeadingService(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res)
+{
+    if (!enu_init_en || dual_antenna_en) {
+        res.success = false;
+        res.message = "Single antenna mode is not enabled (need enu_init_en=true, dual_antenna_en=false)";
+        return true;
+    }
+    if (!heading_estimated) {
+        res.success = false;
+        res.message = "Heading not yet estimated. Move the robot at least " +
+                      std::to_string(heading_min_distance) + "m in a straight line first.";
+        return true;
+    }
+    if (!latest_gnss_antenna_valid) {
+        res.success = false;
+        res.message = "Latest GNSS antenna ENU position not ready yet.";
+        return true;
+    }
+    p_imu->set_heading_yaw_gnss_pos_enu(estimated_heading_yaw, latest_gnss_antenna_enu);
+    res.success = true;
+    res.message = "Heading confirmed: yaw = " + std::to_string(estimated_heading_yaw * 180.0 / M_PI) +
+                  " deg, gnss_enu = (" + std::to_string(latest_gnss_antenna_enu.x()) + ", " +
+                  std::to_string(latest_gnss_antenna_enu.y()) + ", " + std::to_string(latest_gnss_antenna_enu.z()) + ")";
+    ROS_INFO("Heading confirmed via service: %.2f deg, gnss_enu=(%.3f, %.3f, %.3f)",
+             estimated_heading_yaw * 180.0 / M_PI,
+             latest_gnss_antenna_enu.x(), latest_gnss_antenna_enu.y(), latest_gnss_antenna_enu.z());
+    return true;
 }
 
 bool savePoseService(fast_lio_sam::save_poseRequest& req, fast_lio_sam::save_poseResponse& res)
@@ -1928,6 +2199,121 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       *globalMapCloud += *globalSurfCloud;
       pcl::io::savePCDFileBinary(saveMapDirectory + "/filterGlobalMap.pcd", *globalSurfCloudDS);       //  滤波后地图
       int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);       //  稠密地图
+
+      // filterGlobalMap 去除 keypose 周围区域
+      cout << "\nBuilding filterGlobalMapClean ..." << endl;
+      pcl::PointCloud<PointType>::Ptr filterGlobalMapClean = removeKeyposeArea(globalSurfCloudDS, filter_keypose_radius);
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/filterGlobalMapClean.pcd", *filterGlobalMapClean);
+      cout << "filterGlobalMapClean saved: " << filterGlobalMapClean->size() << " pts" << endl;
+
+      // ==================== 过滤地图：去除地面/天花板 + 机器狗本体 ====================
+      cout << "\nBuilding cleaned map (body/height filtered) ..." << endl;
+      cout << "  height: [" << filter_low_threshold << ", " << filter_high_threshold << "]"
+           << "  body box: x[" << filter_car_back << ", " << filter_car_front << "]"
+           << " y[" << filter_car_right << ", " << filter_car_left << "]" << endl;
+
+      pcl::PointCloud<PointType>::Ptr globalCleanCloud(new pcl::PointCloud<PointType>());
+      pcl::PointCloud<PointType>::Ptr globalCleanCloudDS(new pcl::PointCloud<PointType>());
+      for (int i = 0; i < (int)cloudKeyPoses6D->size(); i++) {
+            *globalCleanCloud += *transformPointCloudFiltered(surfCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
+            cout << "\r" << std::flush << "Processing cleaned cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
+      }
+
+      // 去除每个 keypose 周围区域内的点（z轴全高度，机器人经过的位置残留）
+      cout << "\nRemoving points around keyposes from CleanMap ..." << endl;
+      globalCleanCloud = removeKeyposeArea(globalCleanCloud, filter_keypose_radius);
+
+      if(req.resolution != 0)
+      {
+        downSizeFilterSurf.setInputCloud(globalCleanCloud);
+        downSizeFilterSurf.setLeafSize(req.resolution, req.resolution, req.resolution);
+        downSizeFilterSurf.filter(*globalCleanCloudDS);
+      }
+      else
+      {
+        downSizeFilterSurf.setInputCloud(globalCleanCloud);
+        downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        downSizeFilterSurf.filter(*globalCleanCloudDS);
+      }
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/CleanMap.pcd", *globalCleanCloud);
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/CleanMapDS.pcd", *globalCleanCloudDS);
+      cout << "\nClean map saved: " << globalCleanCloud->size() << " pts (dense), "
+           << globalCleanCloudDS->size() << " pts (downsampled)" << endl;
+
+      // ==================== 路径地面地图：从全局点云中，只保留 keypose 方框内且相对高度 < low_threshold 的点 ====================
+      cout << "\nBuilding ground path map ..." << endl;
+      {
+          pcl::PointCloud<PointType>::Ptr groundCloud(new pcl::PointCloud<PointType>());
+          pcl::PointCloud<PointType>::Ptr groundCloudDS(new pcl::PointCloud<PointType>());
+
+          // 全局点云投影 z=0 建 2D KD-tree
+          pcl::PointCloud<PointType>::Ptr global2D(new pcl::PointCloud<PointType>());
+          global2D->resize(globalSurfCloud->size());
+          for (int i = 0; i < (int)globalSurfCloud->size(); i++) {
+              global2D->points[i] = globalSurfCloud->points[i];
+              global2D->points[i].z = 0;
+          }
+          pcl::KdTreeFLANN<PointType> kdtreeGround;
+          kdtreeGround.setInputCloud(global2D);
+
+          std::vector<bool> keep(globalSurfCloud->size(), false);
+          std::vector<int> searchIdx;
+          std::vector<float> searchDist;
+          float r = (float)filter_keypose_radius;
+          float search_r = r * 1.42f;
+
+          // 为每个 keypose 建立 z 查找表（用于快速获取该 keypose 的 z 高度）
+          for (int k = 0; k < (int)cloudKeyPoses6D->size(); k++) {
+              const auto &kp = cloudKeyPoses6D->points[k];
+              PointType searchPt;
+              searchPt.x = kp.x; searchPt.y = kp.y; searchPt.z = 0;
+              float cy = cos(kp.yaw), sy = sin(kp.yaw);
+
+              kdtreeGround.radiusSearch(searchPt, search_r, searchIdx, searchDist);
+              for (int idx : searchIdx) {
+                  float dx = globalSurfCloud->points[idx].x - kp.x;
+                  float dy = globalSurfCloud->points[idx].y - kp.y;
+                  float lx =  cy * dx + sy * dy;
+                  float ly = -sy * dx + cy * dy;
+                  if (lx < -r || lx > r || ly < -r || ly > r)
+                      continue;
+                  // 相对高度 = 点的世界z - keypose的世界z
+                  float dz = globalSurfCloud->points[idx].z - kp.z;
+                  if (dz < filter_low_threshold)
+                      keep[idx] = true;
+              }
+              if (k % 500 == 0)
+                  cout << "\r" << std::flush << "Processing ground keypose " << k << " of " << cloudKeyPoses6D->size() << " ...";
+          }
+
+          for (int i = 0; i < (int)globalSurfCloud->size(); i++) {
+              if (keep[i])
+                  groundCloud->points.push_back(globalSurfCloud->points[i]);
+          }
+          groundCloud->width = groundCloud->points.size();
+          groundCloud->height = 1;
+          groundCloud->is_dense = true;
+
+          if (!groundCloud->empty()) {
+              if(req.resolution != 0) {
+                  downSizeFilterSurf.setInputCloud(groundCloud);
+                  downSizeFilterSurf.setLeafSize(req.resolution, req.resolution, req.resolution);
+                  downSizeFilterSurf.filter(*groundCloudDS);
+              } else {
+                  downSizeFilterSurf.setInputCloud(groundCloud);
+                  downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+                  downSizeFilterSurf.filter(*groundCloudDS);
+              }
+              pcl::io::savePCDFileBinary(saveMapDirectory + "/GroundMap.pcd", *groundCloud);
+              pcl::io::savePCDFileBinary(saveMapDirectory + "/GroundMapDS.pcd", *groundCloudDS);
+              cout << "\nGround path map saved: " << groundCloud->size() << " pts (dense), "
+                   << groundCloudDS->size() << " pts (downsampled)" << endl;
+          } else {
+              cout << "\nWarning: Ground map is empty, skipping save. "
+                   << "Try adjusting filter_low_threshold (current: " << filter_low_threshold << ")" << endl;
+          }
+      }
+
       res.success = ret == 0;
 
       cout << "****************************************************" << endl;
@@ -2215,6 +2601,8 @@ int main(int argc, char **argv)
     nh.param<float>("gpsTimeOffset", gpsTimeOffset, 0.0);
     nh.param<float>("gpsSyncTimeThreshold", gpsSyncTimeThreshold, 0.05);
     nh.param<bool>("enu_init_en", enu_init_en, false);
+    nh.param<bool>("dual_antenna_en", dual_antenna_en, true);
+    nh.param<double>("heading_min_distance", heading_min_distance, 3.0);
     nh.param<string>("common/gps_euler_topic", gps_euler_topic, "/gps/euler");
 
 
@@ -2232,6 +2620,14 @@ int main(int argc, char **argv)
     // savMap
     nh.param<bool>("savePCD", savePCD, false);
     nh.param<std::string>("savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
+
+    nh.param<double>("filter_high_threshold", filter_high_threshold, 0.5);
+    nh.param<double>("filter_low_threshold", filter_low_threshold, -0.3);
+    nh.param<double>("filter_car_left", filter_car_left, 0.3);
+    nh.param<double>("filter_car_right", filter_car_right, -0.3);
+    nh.param<double>("filter_car_front", filter_car_front, 0.5);
+    nh.param<double>("filter_car_back", filter_car_back, -0.5);
+    nh.param<double>("filter_keypose_radius", filter_keypose_radius, 0.5);
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -2273,6 +2669,7 @@ int main(int argc, char **argv)
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
     p_imu->set_enu_init(enu_init_en);
+    p_imu->set_dual_antenna(dual_antenna_en);
 
     //设置gnss外参数
     Gnss_T_wrt_Lidar<<VEC_FROM_ARRAY(extrinT_Gnss2Lidar);
@@ -2336,6 +2733,11 @@ int main(int argc, char **argv)
 
     // savePose  发布轨迹保存服务
     srvSavePose  = nh.advertiseService("/save_pose" ,  &savePoseService);
+
+    // 单天线航向确认服务
+    srvConfirmHeading = nh.advertiseService("/confirm_heading", &confirmHeadingService);
+    pubEstimatedHeading = nh.advertise<nav_msgs::Odometry>("/estimated_heading", 10);
+    pubHeadingViz = nh.advertise<visualization_msgs::MarkerArray>("/single_antenna_heading_viz", 10);
 
     // 回环检测线程
     std::thread loopthread(&loopClosureThread);

@@ -284,17 +284,24 @@ double last_timestamp_gnss = -1.0 ;
 deque<nav_msgs::Odometry> gnss_buffer;
 geometry_msgs::PoseStamped msg_gnss_pose;
 string gnss_topic ;
+string gps_euler_topic;
 bool useImuHeadingInitialization;   
 bool useGpsElevation;             //  是否使用gps高层优化
+bool enu_init_en = false;          //  是否启用 ENU 坐标系初始化
 float gpsCovThreshold;          //   gps方向角和高度差的协方差阈值
 float poseCovThreshold;       //  位姿协方差阈值  from isam2
+float gpsNoiseFloor;          //  GPS因子最小噪声方差 (m^2)，控制RTK权重上限
+float gpsTimeOffset;          //  GPS时间偏移(秒)，补偿RTK固定延迟，负值表示RTK比实际晚
+float gpsSyncTimeThreshold;   //  GPS-LiDAR时间匹配窗口(秒)
 
 M3D Gnss_R_wrt_Lidar(Eye3d) ;         // gnss  与 imu 的外参
 V3D Gnss_T_wrt_Lidar(Zero3d);
+V3D Gnss_T_wrt_IMU(Zero3d);          // GNSS天线在IMU系下的位置（杆臂），用于实时GPS因子补偿
 bool gnss_inited = false ;                        //  是否完成gnss初始化
 shared_ptr<GnssProcess> p_gnss(new GnssProcess());
 GnssProcess gnss_data;
 ros::Publisher pubGnssPath ;
+ros::Publisher pubGnssOdom ;
 nav_msgs::Path gps_path ;
 vector<double>       extrinT_Gnss2Lidar(3, 0.0);
 vector<double>       extrinR_Gnss2Lidar(9, 0.0);
@@ -310,6 +317,14 @@ ros::ServiceServer srvSaveMap;
 ros::ServiceServer srvSavePose;
 bool savePCD;               // 是否保存地图
 string savePCDDirectory;    // 保存路径
+
+// 点云过滤参数（用于保存清洁地图）
+double filter_high_threshold;   // 全局系下最大高度(m)
+double filter_low_threshold;    // 全局系下最小高度(m)
+double filter_car_left;         // 本体系 y 正方向边界(m)
+double filter_car_right;        // 本体系 y 负方向边界(m)
+double filter_car_front;        // 本体系 x 正方向边界(m)
+double filter_car_back;         // 本体系 x 负方向边界(m)
 
 
 /**
@@ -366,6 +381,59 @@ pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::
         cloudOut->points[i].z = transCur(2, 0) * pointFrom.x + transCur(2, 1) * pointFrom.y + transCur(2, 2) * pointFrom.z + transCur(2, 3);
         cloudOut->points[i].intensity = pointFrom.intensity;
     }
+    return cloudOut;
+}
+
+pcl::PointCloud<PointType>::Ptr transformPointCloudFiltered(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose *transformIn)
+{
+    pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+
+    Eigen::Isometry3d T_b_lidar(state_point.offset_R_L_I);
+    T_b_lidar.pretranslate(state_point.offset_T_L_I);
+
+    Eigen::Affine3f T_w_b_ = pcl::getTransformation(transformIn->x, transformIn->y, transformIn->z,
+                                                      transformIn->roll, transformIn->pitch, transformIn->yaw);
+    Eigen::Isometry3d T_w_b;
+    T_w_b.matrix() = T_w_b_.matrix().cast<double>();
+
+    Eigen::Isometry3d T_w_lidar = T_w_b * T_b_lidar;
+    Eigen::Matrix3d R_w_lidar = T_w_lidar.rotation();
+
+    // T_b_lidar 的逆 = T_lidar_b，用于将 LiDAR 点转到 body 系做本体过滤
+    Eigen::Isometry3d T_lidar_b = T_b_lidar.inverse();
+    Eigen::Matrix3d R_lidar_b = T_lidar_b.rotation();
+    Eigen::Vector3d t_lidar_b = T_lidar_b.translation();
+
+    for (int i = 0; i < (int)cloudIn->size(); ++i)
+    {
+        const auto &pt_lidar = cloudIn->points[i];
+        // LiDAR -> body 系，过滤机器狗本体
+        double bx = R_lidar_b(0,0)*pt_lidar.x + R_lidar_b(0,1)*pt_lidar.y + R_lidar_b(0,2)*pt_lidar.z + t_lidar_b(0);
+        double by = R_lidar_b(1,0)*pt_lidar.x + R_lidar_b(1,1)*pt_lidar.y + R_lidar_b(1,2)*pt_lidar.z + t_lidar_b(1);
+        double bz = R_lidar_b(2,0)*pt_lidar.x + R_lidar_b(2,1)*pt_lidar.y + R_lidar_b(2,2)*pt_lidar.z + t_lidar_b(2);
+        if (bx < filter_car_front && bx > filter_car_back &&
+            by < filter_car_left  && by > filter_car_right)
+            continue;
+        if (bz > filter_high_threshold || bz < filter_low_threshold)
+            continue;
+        // 先旋转到 world 方向（不平移），用于高度过滤
+        double rz = R_w_lidar(2,0)*pt_lidar.x + R_w_lidar(2,1)*pt_lidar.y + R_w_lidar(2,2)*pt_lidar.z;
+
+        // 旋转后的z为相对机器人的高度，过滤地面和天花板
+        if (rz > filter_high_threshold || rz < filter_low_threshold)
+            continue;
+
+        // 通过高度过滤后，再做完整变换（旋转+平移）到 world 系
+        PointType pt_out;
+        pt_out.x = T_w_lidar(0,0)*pt_lidar.x + T_w_lidar(0,1)*pt_lidar.y + T_w_lidar(0,2)*pt_lidar.z + T_w_lidar(0,3);
+        pt_out.y = T_w_lidar(1,0)*pt_lidar.x + T_w_lidar(1,1)*pt_lidar.y + T_w_lidar(1,2)*pt_lidar.z + T_w_lidar(1,3);
+        pt_out.z = T_w_lidar(2,0)*pt_lidar.x + T_w_lidar(2,1)*pt_lidar.y + T_w_lidar(2,2)*pt_lidar.z + T_w_lidar(2,3);
+        pt_out.intensity = pt_lidar.intensity;
+        cloudOut->points.push_back(pt_out);
+    }
+    cloudOut->width = cloudOut->points.size();
+    cloudOut->height = 1;
+    cloudOut->is_dense = true;
     return cloudOut;
 }
 
@@ -605,11 +673,30 @@ void addOdomFactor()
 {
     if (cloudKeyPoses3D->points.empty())
     {
-        // 第一帧初始化先验因子
-        gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) <<1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12).finished()); // rad*rad, meter*meter   // indoor 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12    //  1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8
-        gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
-        // 变量节点设置初始值
-        initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+        gtsam::Pose3 priorPose;
+        gtsam::noiseModel::Diagonal::shared_ptr priorNoise;
+
+        if (enu_init_en && p_imu->enu_inited)
+        {
+            // ENU 初始化：使用 GPS+重力 精确计算的初始方向和位置作为 prior
+            priorPose = gtsam::Pose3(
+                gtsam::Rot3::RzRyRx(p_imu->enu_init_roll, p_imu->enu_init_pitch, p_imu->enu_init_yaw),
+                gtsam::Point3(p_imu->enu_init_pos.x(), p_imu->enu_init_pos.y(), p_imu->enu_init_pos.z()));
+            priorNoise = gtsam::noiseModel::Diagonal::Variances(
+                (gtsam::Vector(6) << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12).finished());
+            ROS_INFO("GTSAM prior set with ENU init: roll=%.4f, pitch=%.4f, yaw=%.4f (deg), pos=(%.4f, %.4f, %.4f)",
+                     p_imu->enu_init_roll * 180.0 / M_PI, p_imu->enu_init_pitch * 180.0 / M_PI, p_imu->enu_init_yaw * 180.0 / M_PI,
+                     p_imu->enu_init_pos.x(), p_imu->enu_init_pos.y(), p_imu->enu_init_pos.z());
+        }
+        else
+        {
+            priorPose = trans2gtsamPose(transformTobeMapped);
+            priorNoise = gtsam::noiseModel::Diagonal::Variances(
+                (gtsam::Vector(6) << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12).finished());
+        }
+
+        gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, priorPose, priorNoise));
+        initialEstimate.insert(0, priorPose);
     }
     else
     {
@@ -671,13 +758,11 @@ void addGPSFactor()
     static PointType lastGPSPoint;      // 最新的gps数据
     while (!gnss_buffer.empty())
     {
-        // 删除当前帧0.2s之前的里程计
-        if (gnss_buffer.front().header.stamp.toSec() < lidar_end_time - 0.05)
+        if (gnss_buffer.front().header.stamp.toSec() < lidar_end_time - gpsSyncTimeThreshold)
         {
             gnss_buffer.pop_front();
         }
-        // 超过当前帧0.2s之后，退出
-        else if (gnss_buffer.front().header.stamp.toSec() > lidar_end_time + 0.05)
+        else if (gnss_buffer.front().header.stamp.toSec() > lidar_end_time + gpsSyncTimeThreshold)
         {
             break;
         }
@@ -715,7 +800,7 @@ void addGPSFactor()
                 lastGPSPoint = curGPSPoint;
             // 添加GPS因子
             gtsam::Vector Vector3(3);
-            Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
+            Vector3 << max(noise_x, gpsNoiseFloor), max(noise_y, gpsNoiseFloor), max(noise_z, gpsNoiseFloor);
             gtsam::noiseModel::Diagonal::shared_ptr gps_noise = gtsam::noiseModel::Diagonal::Variances(Vector3);
             gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
             gtSAMgraph.add(gps_factor);
@@ -880,9 +965,6 @@ void correctPoses()
 
     if (aLoopIsClosed == true)
     {
-        std::string _filename = std::getenv("HOME") + savePCDDirectory + "/pose.txt";
-        std::fstream stream(_filename.c_str(), std::fstream::out);
-         
         // 清空里程计轨迹
         globalPath.poses.clear();
         // 更新因子图中所有变量节点的位姿，也就是所有历史关键帧的位姿
@@ -899,13 +981,7 @@ void correctPoses()
             cloudKeyPoses6D->points[i].roll = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().roll();
             cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().pitch();
             cloudKeyPoses6D->points[i].yaw = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().yaw();
-            gtsam::Rot3 R = gtsam::Rot3::RzRyRx(cloudKeyPoses6D->points[i].roll, cloudKeyPoses6D->points[i].pitch, cloudKeyPoses6D->points[i].yaw);
-            // 将旋转矩阵转换为四元数
-            auto quat = R.toQuaternion();
-            stream << i << " "
-                << cloudKeyPoses6D->points[i].x << " " <<  cloudKeyPoses6D->points[i].y << " " << cloudKeyPoses6D->points[i].z << " "
-                << quat.x() << " " << quat.y() << " " << quat.z() << " " << quat.w() 
-                << std::endl;
+
             // 更新里程计轨迹
             updatePath(cloudKeyPoses6D->points[i]);
         }
@@ -1378,7 +1454,7 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
     last_timestamp_gnss = timestamp;
 
     // convert ROS NavSatFix to GeographicLib compatible GNSS message:
-    gnss_data.time = msg_in->header.stamp.toSec();
+    gnss_data.time = msg_in->header.stamp.toSec() + gpsTimeOffset;
     gnss_data.status = msg_in->status.status;
     gnss_data.service = msg_in->status.service;
     gnss_data.pose_cov[0] = msg_in->position_covariance[0];
@@ -1393,21 +1469,19 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
     }else{                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU  ???  调试结果好像是 NED 北东地
 
-        Eigen::Matrix4d gnss_pose = Eigen::Matrix4d::Identity();
-        gnss_pose(0,3) = gnss_data.local_N ;                 //    北
-        gnss_pose(1,3) = gnss_data.local_E ;                 //     东
-        gnss_pose(2,3) = -gnss_data.local_U ;                 //    地
+        // GNSS天线在ENU下的位置
+        V3D P_gnss_enu(gnss_data.local_E, gnss_data.local_N, gnss_data.local_U);
 
-        Eigen::Isometry3d gnss_to_lidar(Gnss_R_wrt_Lidar) ;
-        gnss_to_lidar.pretranslate(Gnss_T_wrt_Lidar);
-        gnss_pose  =  gnss_to_lidar  *  gnss_pose ;                    //  gnss 转到 lidar 系下, （当前Gnss_T_wrt_Lidar，只是一个大致的初值）
+        // 用当前IMU姿态旋转杆臂，将GNSS天线ENU位置补偿到IMU的ENU位置
+        // P_imu_enu = P_gnss_enu - R_enu_imu * T_gnss_in_imu
+        Eigen::Quaterniond q_enu_imu(geoQuat.w, geoQuat.x, geoQuat.y, geoQuat.z);
+        V3D P_imu_enu = P_gnss_enu - q_enu_imu.toRotationMatrix() * Gnss_T_wrt_IMU;
 
         nav_msgs::Odometry gnss_data_enu ;
-        // add new message to buffer:
         gnss_data_enu.header.stamp = ros::Time().fromSec(gnss_data.time);
-        gnss_data_enu.pose.pose.position.x =  gnss_pose(0,3) ;  //gnss_data.local_E ;   北
-        gnss_data_enu.pose.pose.position.y =  gnss_pose(1,3) ;  //gnss_data.local_N;    东
-        gnss_data_enu.pose.pose.position.z =  gnss_pose(2,3) ;  //  地
+        gnss_data_enu.pose.pose.position.x = P_imu_enu(0);
+        gnss_data_enu.pose.pose.position.y = P_imu_enu(1);
+        gnss_data_enu.pose.pose.position.z = P_imu_enu(2);
 
         gnss_data_enu.pose.pose.orientation.x =  geoQuat.x ;                //  gnss 的姿态不可观，所以姿态只用于可视化，取自imu
         gnss_data_enu.pose.pose.orientation.y =  geoQuat.y;
@@ -1420,13 +1494,18 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 
         gnss_buffer.push_back(gnss_data_enu);
 
+        // 发布 gnss odom 用于 rviz 可视化坐标轴
+        gnss_data_enu.header.frame_id = "camera_init";
+        gnss_data_enu.child_frame_id  = "gnss";
+        pubGnssOdom.publish(gnss_data_enu);
+
         // visial gnss path in rviz:
         msg_gnss_pose.header.frame_id = "camera_init";
         msg_gnss_pose.header.stamp = ros::Time().fromSec(gnss_data.time);
 
-        msg_gnss_pose.pose.position.x = gnss_pose(0,3) ;  
-        msg_gnss_pose.pose.position.y = gnss_pose(1,3) ;
-        msg_gnss_pose.pose.position.z = gnss_pose(2,3) ;
+        msg_gnss_pose.pose.position.x = P_imu_enu(0);
+        msg_gnss_pose.pose.position.y = P_imu_enu(1);
+        msg_gnss_pose.pose.position.z = P_imu_enu(2);
 
         gps_path.poses.push_back(msg_gnss_pose);
 
@@ -1565,37 +1644,9 @@ void map_incremental()
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
-//added by ym
-void saveOdometryVerticesKITTIformat(std::string _filename, int submap_id)
-{
-    std::fstream stream(_filename.c_str(), std::fstream::out);
-    static std::vector<geometry_msgs::Pose> poselist;
-    static vector<int> submap_id_list;
-    submap_id_list.push_back(submap_id);
-    geometry_msgs::Pose framePose;
-    framePose.position.x = state_point.pos(0);
-    framePose.position.y = state_point.pos(1);
-    framePose.position.z = state_point.pos(2);
-    framePose.orientation.x = geoQuat.x;
-    framePose.orientation.y = geoQuat.y;
-    framePose.orientation.z = geoQuat.z;
-    framePose.orientation.w = geoQuat.w;
-
-    poselist.push_back(framePose);
-    for(int i = 0; i < poselist.size(); i++)
-    {
-        // 格式: Submap_id pos_x pos_y pos_z quat_x quat_y quat_z quat_w
-        stream << submap_id_list[i]<< " "
-               << poselist[i].position.x  << " " <<poselist[i].position.y << " " << poselist[i].position.z << " "
-               << poselist[i].orientation.x << " " << poselist[i].orientation.y << " " << poselist[i].orientation.z << " " << poselist[i].orientation.w 
-               << std::endl;
-    }    
-
-}
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    将稠密点云从 imu convert to  world
 {
     if (scan_pub_en)
@@ -1624,33 +1675,10 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
     /* 2. noted that pcd save will influence the real-time performences **/
     if (pcd_save_en)
     {
-        // int size = feats_undistort->points.size();
-        // PointCloudXYZI::Ptr laserCloudWorld(
-        //     new PointCloudXYZI(size, 1));
-
-        // for (int i = 0; i < size; i++)
-        // {
-        //     RGBpointBodyToWorld(&feats_undistort->points[i],
-        //                         &laserCloudWorld->points[i]);
-        // }
-        // *pcl_wait_save += *laserCloudWorld;
-
-        // static int scan_wait_num = 0;
-        // scan_wait_num++;
-        // if (pcl_wait_save->size() > 0 && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
-        // {
-        //     pcd_index++;
-        //     string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-        //     pcl::PCDWriter pcd_writer;
-        //     cout << "current scan saved to /PCD/" << all_points_dir << endl;
-        //     pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
-        //     pcl_wait_save->clear();
-        //     scan_wait_num = 0;
-        // }
         int size = feats_undistort->points.size();
         PointCloudXYZI::Ptr laserCloudWorld(
             new PointCloudXYZI(size, 1));
-        *laserCloudWorld = *feats_undistort;
+
         for (int i = 0; i < size; i++)
         {
             RGBpointBodyToWorld(&feats_undistort->points[i],
@@ -1662,30 +1690,13 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull)         //    
         scan_wait_num++;
         if (pcl_wait_save->size() > 0 && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
         {
-          
-            //string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
-
-            std::string all_points_dir = 
-            std::string(ROOT_DIR) + "PCD/" + 
-            [](int index) {
-                std::ostringstream oss;
-                oss << std::setw(6) << std::setfill('0') << index;  // 格式化为 6 位数字，不足补 0
-                return oss.str();
-            }(pcd_index) + 
-            ".pcd";
+            pcd_index++;
+            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
             pcl::PCDWriter pcd_writer;
             cout << "current scan saved to /PCD/" << all_points_dir << endl;
             pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
             pcl_wait_save->clear();
             scan_wait_num = 0;
-            //pcl::io::savePCDFileBinary(pgScansDirectory + curr_node_idx_str + ".pcd", *thisKeyFrame);
-            //added by ym
-            //save odom
-            string odom_dir(string(string(ROOT_DIR) + "PCD/odom") + string(".txt"));
-            saveOdometryVerticesKITTIformat(odom_dir, pcd_index);
-            pcd_index++;
-
-
         }
     }
 }
@@ -1891,14 +1902,7 @@ bool savePoseService(fast_lio_sam::save_poseRequest& req, fast_lio_sam::save_pos
     for(int i = 0; i  < cloudKeyPoses6D->size(); i++){  
         pose_optimized.t =  Eigen::Vector3d(cloudKeyPoses6D->points[i].x, cloudKeyPoses6D->points[i].y, cloudKeyPoses6D->points[i].z  );
         pose_optimized.R = Exp(double(cloudKeyPoses6D->points[i].roll), double(cloudKeyPoses6D->points[i].pitch), double(cloudKeyPoses6D->points[i].yaw) );
-        //WriteText(file_pose_optimized, pose_optimized);
-        gtsam::Rot3 R = gtsam::Rot3::RzRyRx(cloudKeyPoses6D->points[i].roll, cloudKeyPoses6D->points[i].pitch, cloudKeyPoses6D->points[i].yaw);
-            
-        auto quat = R.toQuaternion();
-        file_pose_optimized << std::fixed  << i << " "  <<  pose_optimized.t[0]  <<  " " <<    pose_optimized.t[1]  <<  " " <<    pose_optimized.t[2]  <<  " "
-        << quat.x() << " " << quat.y() << " " << quat.z() << " " << quat.w() 
-        << std::endl;
-
+        WriteText(file_pose_optimized, pose_optimized);
     }
     cout << "Sucess global optimized  poses to pose files ..." << endl;
 
@@ -1953,16 +1957,6 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
             //   *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
             *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
             cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
-            std::string keyFrameIndex = 
-            saveMapDirectory + "/PCD/" +
-            [](int index) {
-                std::ostringstream oss;
-                oss << std::setw(6) << std::setfill('0') << index;  // 格式化为 6 位数字，不足补 0
-                return oss.str();
-            }(i) + 
-            ".pcd";
-            
-            pcl::io::savePCDFileBinary(keyFrameIndex, *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]));
       }
 
       if(req.resolution != 0)
@@ -1995,6 +1989,78 @@ bool saveMapService(fast_lio_sam::save_mapRequest& req, fast_lio_sam::save_mapRe
       *globalMapCloud += *globalSurfCloud;
       pcl::io::savePCDFileBinary(saveMapDirectory + "/filterGlobalMap.pcd", *globalSurfCloudDS);       //  滤波后地图
       int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);       //  稠密地图
+
+      // ==================== 过滤地图：去除地面/天花板 + 机器狗本体 ====================
+      cout << "\nBuilding cleaned map (body/height filtered) ..." << endl;
+      cout << "  height: [" << filter_low_threshold << ", " << filter_high_threshold << "]"
+           << "  body box: x[" << filter_car_back << ", " << filter_car_front << "]"
+           << " y[" << filter_car_right << ", " << filter_car_left << "]" << endl;
+
+      pcl::PointCloud<PointType>::Ptr globalCleanCloud(new pcl::PointCloud<PointType>());
+      pcl::PointCloud<PointType>::Ptr globalCleanCloudDS(new pcl::PointCloud<PointType>());
+      for (int i = 0; i < (int)cloudKeyPoses6D->size(); i++) {
+            *globalCleanCloud += *transformPointCloudFiltered(surfCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
+            cout << "\r" << std::flush << "Processing cleaned cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
+      }
+
+      // 去除每个 keypose 周围 1m² 内的点（机器人经过的位置残留）
+      cout << "\nRemoving points around keyposes ..." << endl;
+      {
+          pcl::KdTreeFLANN<PointType> kdtree;
+          kdtree.setInputCloud(globalCleanCloud);
+          std::vector<bool> keep(globalCleanCloud->size(), true);
+          std::vector<int> searchIdx;
+          std::vector<float> searchDist;
+
+          for (int k = 0; k < (int)cloudKeyPoses6D->size(); k++) {
+              const auto &kp = cloudKeyPoses6D->points[k];
+              PointType searchPt;
+              searchPt.x = kp.x; searchPt.y = kp.y; searchPt.z = kp.z;
+
+              Eigen::Affine3f T_w_b = pcl::getTransformation(kp.x, kp.y, kp.z, kp.roll, kp.pitch, kp.yaw);
+              Eigen::Affine3f T_b_w = T_w_b.inverse();
+
+              kdtree.radiusSearch(searchPt, 1.0f, searchIdx, searchDist);
+              for (int idx : searchIdx) {
+                  Eigen::Vector3f pw(globalCleanCloud->points[idx].x,
+                                     globalCleanCloud->points[idx].y,
+                                     globalCleanCloud->points[idx].z);
+                  Eigen::Vector3f pl = T_b_w * pw;
+                  if (pl.x() > -0.5f && pl.x() < 0.5f && pl.y() > -0.5f && pl.y() < 0.5f)
+                      keep[idx] = false;
+              }
+          }
+
+          pcl::PointCloud<PointType>::Ptr tmp(new pcl::PointCloud<PointType>());
+          tmp->reserve(globalCleanCloud->size());
+          for (int i = 0; i < (int)globalCleanCloud->size(); i++) {
+              if (keep[i])
+                  tmp->points.push_back(globalCleanCloud->points[i]);
+          }
+          tmp->width = tmp->points.size();
+          tmp->height = 1;
+          tmp->is_dense = true;
+          cout << "Keypose filter: " << globalCleanCloud->size() << " -> " << tmp->size() << " pts" << endl;
+          globalCleanCloud = tmp;
+      }
+
+      if(req.resolution != 0)
+      {
+        downSizeFilterSurf.setInputCloud(globalCleanCloud);
+        downSizeFilterSurf.setLeafSize(req.resolution, req.resolution, req.resolution);
+        downSizeFilterSurf.filter(*globalCleanCloudDS);
+      }
+      else
+      {
+        downSizeFilterSurf.setInputCloud(globalCleanCloud);
+        downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        downSizeFilterSurf.filter(*globalCleanCloudDS);
+      }
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/CleanMap.pcd", *globalCleanCloud);
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/CleanMapDS.pcd", *globalCleanCloudDS);
+      cout << "\nClean map saved: " << globalCleanCloud->size() << " pts (dense), "
+           << globalCleanCloudDS->size() << " pts (downsampled)" << endl;
+
       res.success = ret == 0;
 
       cout << "****************************************************" << endl;
@@ -2278,6 +2344,11 @@ int main(int argc, char **argv)
     nh.param<bool>("useGpsElevation", useGpsElevation, false);
     nh.param<float>("gpsCovThreshold", gpsCovThreshold, 2.0);
     nh.param<float>("poseCovThreshold", poseCovThreshold, 25.0);
+    nh.param<float>("gpsNoiseFloor", gpsNoiseFloor, 1.0);
+    nh.param<float>("gpsTimeOffset", gpsTimeOffset, 0.0);
+    nh.param<float>("gpsSyncTimeThreshold", gpsSyncTimeThreshold, 0.05);
+    nh.param<bool>("enu_init_en", enu_init_en, false);
+    nh.param<string>("common/gps_euler_topic", gps_euler_topic, "/gps/euler");
 
 
     // Visualization
@@ -2294,6 +2365,13 @@ int main(int argc, char **argv)
     // savMap
     nh.param<bool>("savePCD", savePCD, false);
     nh.param<std::string>("savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
+
+    nh.param<double>("filter_high_threshold", filter_high_threshold, 0.5);
+    nh.param<double>("filter_low_threshold", filter_low_threshold, -0.3);
+    nh.param<double>("filter_car_left", filter_car_left, 0.3);
+    nh.param<double>("filter_car_right", filter_car_right, -0.3);
+    nh.param<double>("filter_car_front", filter_car_front, 0.5);
+    nh.param<double>("filter_car_back", filter_car_back, -0.5);
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -2334,10 +2412,16 @@ int main(int argc, char **argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov)); // 加速度协方差
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->set_enu_init(enu_init_en);
 
     //设置gnss外参数
     Gnss_T_wrt_Lidar<<VEC_FROM_ARRAY(extrinT_Gnss2Lidar);
     Gnss_R_wrt_Lidar<<MAT_FROM_ARRAY(extrinR_Gnss2Lidar);
+    // GNSS天线在IMU系下的位置（杆臂）: P_imu = R_lidar_imu * P_lidar + T_lidar_imu
+    Gnss_T_wrt_IMU = Lidar_R_wrt_IMU * Gnss_T_wrt_Lidar + Lidar_T_wrt_IMU;
+    // GNSS帧到IMU帧的旋转: R_imu_gnss = R_imu_lidar * R_lidar_gnss
+    M3D Gnss_R_to_IMU  = Lidar_R_wrt_IMU * Gnss_R_wrt_Lidar;
+    p_imu->set_gnss_ext(Gnss_T_wrt_IMU, Gnss_R_to_IMU);
 
     double epsi[23] = {0.001};
     fill(epsi, epsi + 23, 0.001);
@@ -2370,6 +2454,7 @@ int main(int argc, char **argv)
 
     ros::Publisher pubPathUpdate = nh.advertise<nav_msgs::Path>("fast_lio_sam/path_update", 100000);                   //  isam更新后的path
     pubGnssPath = nh.advertise<nav_msgs::Path>("/gnss_path", 100000);
+    pubGnssOdom = nh.advertise<nav_msgs::Odometry>("/gnss_odom", 100000);
     pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/keyframe_submap", 1); // 发布局部关键帧map的特征点云
     pubOptimizedGlobalMap = nh.advertise<sensor_msgs::PointCloud2>("fast_lio_sam/mapping/map_global_optimized", 1); // 发布局部关键帧map的特征点云
 
@@ -2383,7 +2468,9 @@ int main(int argc, char **argv)
 
     // gnss
     ros::Subscriber sub_gnss = nh.subscribe(gnss_topic, 200000, gnss_cbk);
-    
+    // gps euler (NED → ENU, for ENU coordinate initialization)
+    ros::Subscriber sub_gps_euler = nh.subscribe(gps_euler_topic, 200000, &ImuProcess::gps_euler_cbk, p_imu.get());
+
     // saveMap  发布地图保存服务
     srvSaveMap  = nh.advertiseService("/save_map" ,  &saveMapService);
 
